@@ -11,7 +11,7 @@ El objetivo principal de esta investigación es analizar la transmisión de los 
 
 ---
 
-## 🛠️ Metodología y Marco Econométrico
+## Metodología y Marco Econométrico
 
 Siguiendo las mejores prácticas de series de tiempo del seminario:
 
@@ -28,7 +28,7 @@ Siguiendo las mejores prácticas de series de tiempo del seminario:
 
 ---
 
-## 📊 Datos y Fuentes
+##  Datos y Fuentes
 
 Todas las series provienen de **FRED (Federal Reserve Economic Data)** a frecuencia mensual [22, 23]:
 
@@ -40,7 +40,7 @@ Todas las series provienen de **FRED (Federal Reserve Economic Data)** a frecuen
 
 ---
 
-## 📁 Estructura del Repositorio
+##  Estructura del Repositorio
 
 ```text
 ├── data/               # Bases de datos procesadas (.dta) y raw de FRED
