@@ -1,0 +1,221 @@
+*==============================================================================*
+* Replicación de Bernanke y Blinder (1992), "The Federal Funds Rate and the     *
+* Channels of Monetary Transmission", AER 82(4): 901-921.                       *
+*                                                                              *
+* 01_datos_BB1992.do — Descarga y construcción de la base mensual 1959m1-1989m12*
+* Seminario de Investigación: Macroeconometría Aplicada — ITAM, Otoño 2026      *
+* Autor: Felipe                                                                *
+* Requiere: Stata 19 y una clave API de FRED (comando import fred).            *
+*==============================================================================*
+* El paper usa la base comercial DRI (Data Resources, Inc.), que ya no existe.  *
+* Aquí se descargan de FRED las series equivalentes. La tabla de equivalencias *
+* (código DRI -> código FRED) está en el Reporte 1 y en el codebook.           *
+* Este archivo sustituye las secciones 1-2 (descarga y limpieza) del do-file   *
+* anterior; conserva los nombres ln_cpi, ln_dep_real, ln_sec_real,             *
+* ln_loan_real y pre_volcker para que el código de los VAR siga funcionando.   *
+* Funciona para sacar datos directamente de la FRED                            *
+*==============================================================================*
+
+version 19
+clear all
+set more off
+
+*--- 0. Rutas y carpetas del proyecto -----------------------------------------*
+* Cambia esta línea si quieres una ruta fija.
+global raiz "`c(pwd)'/Seminario_Macroeconometria_ITAM"
+
+foreach d in "" "/01_do" "/02_datos" "/02_datos/raw" "/02_datos/limpios" ///
+             "/03_graficas" "/04_tablas" "/05_logs" "/06_documentos" {
+    capture mkdir "$raiz`d'"
+}
+global raw     "$raiz/02_datos/raw"
+global limpios "$raiz/02_datos/limpios"
+global graf    "$raiz/03_graficas"
+global logs    "$raiz/05_logs"
+
+capture log close
+log using "$logs/01_datos_BB1992.log", replace text
+
+*--- 0.1 Clave API de FRED ----------------------------------------------------*
+* Pega tu clave la primera vez; "permanently" la guarda en tu instalación.
+* No subas este archivo con tu clave a ningún repositorio público.
+local mi_fredkey "PEGA_AQUI_TU_API_KEY"
+if "`mi_fredkey'" != "PEGA_AQUI_TU_API_KEY" {
+    set fredkey `mi_fredkey', permanently
+}
+
+
+*==============================================================================*
+* 1. DESCARGA DESDE FRED                                                       *
+*==============================================================================*
+* Todas las series son mensuales en FRED, así que no hay que agregar semanas.
+*
+* Núcleo (entran en los VAR del proyecto):
+*   FEDFUNDS        Tasa efectiva de fondos federales (%; prom. de datos diarios)
+*   GS10            Bono del Tesoro a 10 años, madurez constante (%)
+*   LNS14000061     Desempleo, hombres 25-54 años (%, a.e.) = medida del paper
+*   UNRATE          Desempleo total 16+ (%, a.e.) — alternativa/robustez
+*   CPIAUCSL        IPC urbano, todas las partidas (1982-84=100, a.e.)
+*   LOANS           Préstamos y arrendamientos, bancos comerciales (mmd, a.e., H.8)
+*   INVEST          Títulos en el crédito bancario, bancos comerciales (mmd, a.e., H.8)
+*   DPSACBM027SBOG  Depósitos, bancos comerciales (mmd, a.e., H.8) — desde 1973m1
+*   USREC           Indicador de recesiones NBER (1 = recesión)
+*
+* Sección I del paper (contenido informativo; robustez):
+*   INDPRO CUMFNS PAYEMS HOUST RPI DPCERA3M086SBEA M1SL M2SL TB3MS TB6MS GS1
+* Sección III del paper (mercado de reservas):
+*   NONBORRES TOTRESNS
+*
+* NO están en FRED para 1959-1989 como serie única (se documentan en el
+* codebook; si se necesitan, vienen de la base FRED-MD de McCracken y Ng):
+*   ventas al menudeo reales, órdenes de bienes durables, papel comercial a 6 meses.
+
+local nucleo  FEDFUNDS GS10 LNS14000061 UNRATE CPIAUCSL LOANS INVEST DPSACBM027SBOG USREC
+local secc1   INDPRO CUMFNS PAYEMS HOUST RPI DPCERA3M086SBEA M1SL M2SL TB3MS TB6MS GS1
+local secc3   NONBORRES TOTRESNS
+
+import fred `nucleo' `secc1' `secc3', daterange(1959-01-01 1989-12-31) clear
+
+generate datem = mofd(daten)
+format datem %tm
+drop daten datestr
+order datem
+tsset datem, monthly
+
+* FRED revisa las series: se guarda la descarga cruda con su fecha.
+notes: Descarga FRED (import fred) el `c(current_date)'
+save "$raw/fred_BB1992_raw.dta", replace
+
+
+*==============================================================================*
+* 2. VARIABLES CONSTRUIDAS (definiciones del paper)                           *
+*==============================================================================*
+* Tasas en puntos porcentuales; niveles e índices en 100*log, de modo que las
+* IRF se leen como desviaciones porcentuales aproximadas.
+
+* Indicadores de política
+generate double FFBOND = FEDFUNDS - GS10        // spread fondos federales - bono 10a
+generate double TERM   = GS10 - GS1             // pendiente (Stock-Watson)
+
+* Submuestra pre-Volcker: el paper corta en septiembre de 1979
+generate byte pre_volcker = (datem <= tm(1979m9))
+
+* Precios
+generate double ln_cpi   = 100*ln(CPIAUCSL)
+generate double infl_12m = ln_cpi - L12.ln_cpi  // inflación anual (%) sólo descriptiva
+
+* Balance bancario deflactado por el IPC ("deflated by the CPI", Sección IV)
+generate double ln_loan_real = 100*ln(LOANS          / CPIAUCSL)
+generate double ln_sec_real  = 100*ln(INVEST         / CPIAUCSL)
+generate double ln_dep_real  = 100*ln(DPSACBM027SBOG / CPIAUCSL)
+
+* Variables de actividad y dinero en log-niveles (Tablas 1-2 del paper)
+foreach v in INDPRO PAYEMS HOUST RPI DPCERA3M086SBEA M1SL M2SL {
+    generate double ln_`v' = 100*ln(`v')
+}
+
+*--- 2.1 Etiquetas ------------------------------------------------------------*
+label variable datem           "Fecha (mensual)"
+label variable FEDFUNDS        "Tasa efectiva de fondos federales (%)"
+label variable GS10            "Bono del Tesoro 10 años (%)"
+label variable GS1             "Bono del Tesoro 1 año (%)"
+label variable TB3MS           "Cete EE.UU. 3 meses, mercado secundario (%)"
+label variable TB6MS           "Cete EE.UU. 6 meses, mercado secundario (%)"
+label variable LNS14000061     "Desempleo hombres 25-54 (%)"
+label variable UNRATE          "Desempleo total 16+ (%)"
+label variable CPIAUCSL        "IPC urbano (1982-84=100)"
+label variable LOANS           "Préstamos y arrendamientos, bancos comerciales (mmd)"
+label variable INVEST          "Títulos en crédito bancario, bancos comerciales (mmd)"
+label variable DPSACBM027SBOG  "Depósitos, bancos comerciales (mmd)"
+label variable USREC           "Recesión NBER (=1)"
+label variable INDPRO          "Producción industrial (2017=100)"
+label variable CUMFNS          "Utilización de capacidad, manufacturas (%)"
+label variable PAYEMS          "Empleo no agrícola (miles)"
+label variable HOUST           "Inicios de vivienda (miles, tasa anual)"
+label variable RPI             "Ingreso personal real (mmd enc. 2017)"
+label variable DPCERA3M086SBEA "Consumo personal real (índice 2017=100)"
+label variable M1SL            "M1 (mmd)"
+label variable M2SL            "M2 (mmd)"
+label variable NONBORRES       "Reservas no prestadas (mmd)"
+label variable TOTRESNS        "Reservas totales (mmd)"
+label variable FFBOND          "FEDFUNDS - GS10 (pp)"
+label variable TERM            "GS10 - GS1 (pp)"
+label variable pre_volcker     "=1 si fecha <= 1979m9"
+label variable ln_cpi          "100*log(IPC)"
+label variable infl_12m        "Inflación IPC a 12 meses (%)"
+label variable ln_loan_real    "100*log(Préstamos reales)"
+label variable ln_sec_real     "100*log(Títulos reales)"
+label variable ln_dep_real     "100*log(Depósitos reales)"
+
+compress
+
+
+*==============================================================================*
+* 3. REVISIONES RÁPIDAS                                                        *
+*==============================================================================*
+summarize FEDFUNDS FFBOND LNS14000061 UNRATE ln_cpi ln_loan_real ln_sec_real ln_dep_real
+
+* Cobertura efectiva de cada serie
+foreach v in `nucleo' `secc1' `secc3' {
+    quietly summarize datem if !missing(`v')
+    display as text %-18s "`v'" as result %tm r(min) "  a  " %tm r(max)
+}
+
+* Observaciones disponibles para el VAR bancario pre-Volcker
+quietly count if pre_volcker == 1 & !missing(ln_dep_real, ln_sec_real, ln_loan_real)
+display as text "Obs. con balance bancario completo, pre-Volcker: " as result r(N)
+
+*--- 3.1 (Opcional) Comparación con la base entregada en CSV ------------------*
+* Si copiaste bb1992_fred_mensual_1959_1989.csv a 02_datos/raw, este bloque
+* reporta la diferencia absoluta máxima entre tu descarga y esa base. Deben ser
+* cero o casi cero; diferencias pequeñas pueden venir de revisiones de FRED.
+local comparar FEDFUNDS GS10 LNS14000061 UNRATE CPIAUCSL LOANS INVEST ///
+               DPSACBM027SBOG INDPRO PAYEMS M1SL M2SL TB3MS RPI
+
+capture confirm file "$raw/bb1992_fred_mensual_1959_1989.csv"
+if !_rc {
+    preserve
+    import delimited using "$raw/bb1992_fred_mensual_1959_1989.csv", ///
+        clear varnames(1) case(preserve) stringcols(1)
+    generate datem = mofd(date(date, "YMD"))
+    format datem %tm
+    keep datem `comparar'
+    foreach v of local comparar {
+        rename `v' `v'_csv
+    }
+    tempfile csv
+    save `csv'
+    restore
+
+    merge 1:1 datem using `csv', nogenerate
+    display as text _n "Diferencia absoluta máxima (descarga - CSV):"
+    foreach v of local comparar {
+        quietly generate double dif_`v' = abs(`v' - `v'_csv)
+        quietly summarize dif_`v'
+        display as text %-18s "`v'" as result %14.6f r(max)
+    }
+    drop *_csv dif_*
+}
+
+
+*==============================================================================*
+* 4. GUARDAR Y FIGURA DESCRIPTIVA (análoga a la Figura 1 del paper)             *
+*==============================================================================*
+order datem pre_volcker USREC FEDFUNDS GS10 FFBOND LNS14000061 UNRATE ///
+      CPIAUCSL ln_cpi LOANS INVEST DPSACBM027SBOG ln_loan_real ln_sec_real ln_dep_real
+notes: Muestra 1959m1-1989m12. Fuente: FRED, Federal Reserve Bank of St. Louis.
+save "$limpios/datos_bernanke_blinder_1992.dta", replace
+
+* Sombreado de recesiones NBER con barras
+generate rec_sombra = cond(USREC == 1, 20, .)
+twoway (bar rec_sombra datem, base(-4) barwidth(1) color(gs14) lwidth(none)) ///
+       (tsline FEDFUNDS, lcolor(navy) lwidth(medthick))                    ///
+       (tsline FFBOND,   lcolor(maroon)),                                  ///
+       xline(`=tm(1979m10)', lpattern(dash) lcolor(gs8)) yline(0, lcolor(black))  ///
+       ytitle("% anual") xtitle("")                                        ///
+       legend(order(2 "FUNDS" 3 "FFBOND = FUNDS - bono 10 años") rows(1) pos(6)) ///
+       note("Fuente: FRED. Sombreado: recesiones NBER. Línea punteada: oct-1979.")
+graph export "$graf/fig1_funds_ffbond.png", replace width(2000)
+drop rec_sombra
+
+log close
