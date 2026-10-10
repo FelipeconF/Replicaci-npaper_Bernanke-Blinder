@@ -1,0 +1,121 @@
+gen datem = mofd(daten)
+format datem %tm
+tsset datem
+
+label variable datem "Fecha Mensual"
+
+* ------------------------------------------------------------------------------
+* 3. TRANSFORMACIÓN DE VARIABLES (REGLAS DEL SEMINARIO ITAM)
+* ------------------------------------------------------------------------------
+* Regla del curso: 
+* - Variables en niveles/índices se transforman en logaritmos (x 100).
+* - Variables en puntos porcentuales (tasas de interés y desempleo) se dejan en niveles.
+
+* A. Variables de Política Monetaria y Tasas (en niveles %)
+gen r_fedfunds = FEDFUNDS
+label variable r_fedfunds "Tasa de Fondos Federales (%)"
+
+gen r_tbill3m = TB3MS
+label variable r_tbill3m "Tasa T-Bill 3 Meses (%)"
+
+gen r_bond10y = GS10
+label variable r_bond10y "Rendimiento Bono Tesoro 10A (%)"
+
+* B. Spread de Tasa de Interés (FFBOND en Bernanke & Blinder)
+gen ffbond = FEDFUNDS - GS10
+label variable ffbond "Spread: Fed Funds - Bono 10A (P.p.)"
+
+* C. Variables en Puntos Porcentuales
+gen unrate = UNRATE
+label variable unrate "Tasa de Desempleo (%)"
+
+* D. Variables en Niveles -> Transformación a 100 * log(X)
+gen l_cpi = 100 * log(CPIAUCSL)
+label variable l_cpi "log(IPC) * 100"
+
+gen l_indpro = 100 * log(INDPRO)
+label variable l_indpro "log(Producción Industrial) * 100"
+
+gen l_payems = 100 * log(PAYEMS)
+label variable l_payems "log(Empleo Total) * 100"
+
+gen l_houst = 100 * log(HOUST)
+label variable l_houst "log(Inicios de Vivienda) * 100"
+
+gen l_rpi = 100 * log(RPI)
+label variable l_rpi "log(Ingreso Personal Real) * 100"
+
+gen l_dgorder = 100 * log(DGORDER)
+label variable l_dgorder "log(Pedidos Bienes Duraderos) * 100"
+
+* E. Variables de Balances Bancarios (en términos reales deflactados por IPC)
+gen l_real_loans = 100 * log(TOTLL / (CPIAUCSL / 100))
+label variable l_real_loans "log(Préstamos Bancarios Reales) * 100"
+
+gen l_real_deposits = 100 * log(DPSACBW027SBOG / (CPIAUCSL / 100))
+label variable l_real_deposits "log(Depósitos Bancarios Reales) * 100"
+
+* ------------------------------------------------------------------------------
+* 4. DEFINICIÓN DE MUESTRAS HISTÓRICAS
+* ------------------------------------------------------------------------------
+* Muestra Completa de B&B (1992): 1959m7 a 1989m12
+gen sample_full = (datem >= m(1959m7) & datem <= m(1989m12))
+
+* Muestra Pre-Volcker (Régimen de Tasas): 1959m7 a 1979m9
+gen sample_prevolcker = (datem >= m(1959m7) & datem <= m(1979m9))
+
+* Muestra de Balances Bancarios (Sección IV): 1959m1 a 1978m12
+gen sample_banks = (datem >= m(1959m1) & datem <= m(1978m12))
+
+* Guardar base de datos procesada
+save "bernanke_blinder_data.dta", replace
+display "Base de datos guardada exitosamente como bernanke_blinder_data.dta"
+
+* ------------------------------------------------------------------------------
+* 5. ESPECIFICACIÓN Y ESTIMACIÓN DEL MODELO VAR (EJEMPLO MUESTRA PRE-VOLCKER)
+* ------------------------------------------------------------------------------
+* Modelo Benchmark de 3 variables: [Desempleo -> IPC -> Fed Funds Rate]
+* Ordenamiento de Cholesky: La actividad real y precios reaccionan con rezago, 
+* mientras que la Fed observa el desempleo e inflación contemporáneos.
+
+preserve
+keep if sample_prevolcker == 1
+
+* A. Selección del Número Óptimo de Rezagos (varsoc)
+display "--- SELECCIÓN DE REZAGOS (IC) ---"
+varsoc unrate l_cpi r_fedfunds, maxlag(12)
+
+* B. Estimación del VAR (ej. p=6 rezagos como en B&B 1992)
+display "--- ESTIMACIÓN DEL VAR(6) EN NIVELES ---"
+var unrate l_cpi r_fedfunds, lags(1/6)
+
+* C. Prueba de Estabilidad (Autovalores dentro del Círculo Unitario)
+display "--- PRUEBA DE ESTABILIDAD DEL VAR ---"
+varstable
+
+* D. Prueba de Autocorrelación de Residuos (Portmanteau / White Noise)
+display "--- PRUEBA DE AUTOCORRELACIÓN DE RESIDUOS ---"
+wntestq
+
+* E. Prueba de Causalidad de Granger
+display "--- CAUSALIDAD DE GRANGER ---"
+vargranger
+
+* F. Estimación del SVAR con Identificación de Cholesky (OIRF & FEVD)
+irf create model_bb, set(irf_bb) step(24) replace
+
+* Graficar Funciones de Impulso-Respuesta Estructurales (OIRF)
+* Respuesta del Desempleo e Inflación ante un Shock de Política Monetaria (FEDFUNDS)
+irf graph oirf, impulse(r_fedfunds) response(unrate l_cpi) ///
+    title("Respuesta Dinámica ante Shock de Política Monetaria (OIRF)") ///
+    subtitle("Bernanke & Blinder (1992) - Identificación Cholesky") ///
+    ytitle("Puntos Porcentuales / Log x 100") xtitle("Meses")
+
+* Tabla de Descomposición de Varianza del Error de Pronóstico (FEVD)
+irf table fevd, impulse(r_fedfunds) response(unrate l_cpi) step(24)
+
+restore
+
+* ==============================================================================
+* FIN DEL DO-FILE
+* ==============================================================================
