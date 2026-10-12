@@ -1,0 +1,313 @@
+* 0. CONFIGURACIÓN INICIAL                                                     *
+*==============================================================================*
+version 19
+clear all
+set more off
+set linesize 120
+capture log close _all
+
+*--- Estructura de carpetas del proyecto (se usará todo el semestre) ----------*
+* Por defecto, la carpeta se crea dentro del directorio de trabajo actual.
+* Si la quieres en otro lugar, reemplaza la ruta por la completa, p. ej.:
+*   global raiz "C:/Users/Felipe/Documents/Seminario_Macroeconometria_ITAM"
+* (Stata acepta "/" como separador en Windows, Mac y Linux.)
+global raiz "`c(pwd)'/Seminario_Macroeconometria_ITAM"
+
+global dofiles  "$raiz/01_do"
+global datos    "$raiz/02_datos"
+global raw      "$raiz/02_datos/raw"
+global limpios  "$raiz/02_datos/limpios"
+global graf     "$raiz/03_graficas"
+global tab      "$raiz/04_tablas"
+global logs     "$raiz/05_logs"
+global docs     "$raiz/06_documentos"
+
+foreach carpeta in raiz dofiles datos raw limpios graf tab logs docs {
+    capture mkdir "${`carpeta'}"
+}
+
+log using "$logs/replica_bb1992.log", replace text
+
+display as text "Carpeta del proyecto: " as result "$raiz"
+display as text "Fecha de ejecución:   " as result "`c(current_date)' `c(current_time)'"
+
+*--- API key de FRED ----------------------------------------------------------*
+* `import fred` requiere una clave personal. Pega tu clave en la línea de abajo
+* la primera vez. La opción "permanently" la guarda en tu instalación de Stata,
+* así que después puedes volver a dejar el texto de ejemplo.
+* NO subas este archivo con tu clave a repositorios públicos.
+local mi_fredkey "PEGA_AQUI_TU_API_KEY"
+if "`mi_fredkey'" != "PEGA_AQUI_TU_API_KEY" {
+    set fredkey `mi_fredkey', permanently
+}
+
+*--- Parámetros del análisis --------------------------------------------------*
+local p     = 6     // Rezagos del VAR: fijados en 6, como en el paper
+                    // (B&B usan "six lags of each variable" en todos sus VAR).
+local pmax  = 12    // Rezago máximo para varsoc: un año de datos mensuales,
+                    // regla práctica de las notas del curso para datos
+                    // mensuales. Se reporta sólo como diagnóstico.
+local hlag  = 12    // Rezagos para las pruebas de autocorrelación.
+
+* Cómo pasar préstamos y depósitos (semanales) a frecuencia mensual:
+*   "eop"      = último dato del mes (el paper usa el último miércoles del mes)
+*   "promedio" = promedio de las semanas del mes
+global agreg_semanal "eop"
+
+
+*==============================================================================*
+* 1. DESCARGA DE DATOS DESDE FRED                                              *
+*==============================================================================*
+* Sólo se descargan las series que entran en los modelos:
+*   Mensuales : FEDFUNDS, UNRATE, CPIAUCSL, INVEST (títulos, H.8)
+*   Semanales : TOTLL (préstamos), DPSACBW027SBOG (depósitos), H.8
+* Los datos de FRED se revisan con el tiempo; por eso se guarda una copia
+* cruda con la fecha de descarga, para poder reproducir los resultados.
+
+*--- 1.1 Series semanales -> mensuales -----------------------------------------*
+import fred TOTLL DPSACBW027SBOG, daterange(1959-07-01 1989-12-31) clear
+notes: Descarga FRED (semanal) el `c(current_date)'
+save "$raw/fred_semanal_raw.dta", replace
+
+generate datem = mofd(daten)
+format datem %tm
+
+if "$agreg_semanal" == "eop" {
+    * Último miércoles disponible de cada mes (criterio del paper).
+    bysort datem (daten): keep if _n == _N
+    keep datem TOTLL DPSACBW027SBOG
+}
+else if "$agreg_semanal" == "promedio" {
+    collapse (mean) TOTLL DPSACBW027SBOG, by(datem)
+}
+else {
+    display as error "global agreg_semanal debe ser eop o promedio"
+    exit 198
+}
+
+tempfile semanal
+save `semanal'
+
+*--- 1.2 Series mensuales y unión ---------------------------------------------*
+import fred FEDFUNDS UNRATE CPIAUCSL INVEST, daterange(1959-07-01 1989-12-31) clear
+notes: Descarga FRED (mensual) el `c(current_date)'
+save "$raw/fred_mensual_raw.dta", replace
+
+generate datem = mofd(daten)
+format datem %tm
+drop datestr daten
+
+* Las series bancarias semanales empiezan en 1973: antes de esa fecha quedan
+* como faltantes (no se imputan, no se inventan datos).
+merge 1:1 datem using `semanal', keep(master match) nogenerate
+
+
+*==============================================================================*
+* 2. LIMPIEZA, MUESTRA Y TRANSFORMACIONES                                      *
+*==============================================================================*
+
+*--- 2.1 Serie de tiempo y muestra baseline -----------------------------------*
+keep if datem >= m(1959m7) & datem <= m(1989m12)
+tsset datem, monthly
+tsreport, report          // Verifica que no haya huecos en el calendario.
+
+* Submuestra pre-Volcker: termina en 1979m9 (Volcker cambia el procedimiento
+* operativo en octubre de 1979). Es la muestra de las Tablas 1B y 2B.
+generate byte pre_volcker = (datem <= m(1979m9))
+label define lb_pv 0 "Post-oct 1979" 1 "Pre-Volcker"
+label values pre_volcker lb_pv
+
+*--- 2.2 Transformaciones (lineamientos del curso) ----------------------------*
+* - El VAR se estima en NIVELES: aunque haya raíces unitarias, OLS en niveles
+*   es consistente y conserva las relaciones de largo plazo (Sims, Stock y
+*   Watson, 1990); diferenciar tiraría esa información.
+* - Tasas en puntos porcentuales (FEDFUNDS, UNRATE): sin transformar.
+* - Índices y niveles: 100*log, para que las IRF se lean como desviaciones
+*   porcentuales aproximadas.
+* - Variables bancarias: deflactadas por el IPC y luego 100*log, como en B&B
+*   ("deflated by the CPI"). El cociente X/IPC sólo cambia el log en una
+*   constante respecto a usar el IPC reescalado, lo cual no afecta el VAR.
+
+generate double ln_cpi       = 100*ln(CPIAUCSL)
+generate double ln_dep_real  = 100*ln(DPSACBW027SBOG / CPIAUCSL)
+generate double ln_sec_real  = 100*ln(INVEST         / CPIAUCSL)
+generate double ln_loan_real = 100*ln(TOTLL          / CPIAUCSL)
+
+*--- 2.3 Etiquetas ------------------------------------------------------------*
+label variable datem          "Fecha (mensual)"
+label variable FEDFUNDS       "Tasa de fondos federales efectiva (%)"
+label variable UNRATE         "Tasa de desempleo (%)"
+label variable CPIAUCSL       "IPC urbano, todas las partidas (índice)"
+label variable INVEST         "Títulos en crédito bancario, bancos comerciales (mmd)"
+label variable TOTLL          "Préstamos y arrendamientos, bancos comerciales (mmd)"
+label variable DPSACBW027SBOG "Depósitos, bancos comerciales (mmd)"
+label variable ln_cpi         "100*log(IPC)"
+label variable ln_dep_real    "100*log(Depósitos reales)"
+label variable ln_sec_real    "100*log(Títulos reales)"
+label variable ln_loan_real   "100*log(Préstamos reales)"
+label variable pre_volcker    "=1 si fecha <= 1979m9"
+
+order datem pre_volcker FEDFUNDS UNRATE CPIAUCSL ln_cpi ///
+      DPSACBW027SBOG TOTLL INVEST ln_dep_real ln_sec_real ln_loan_real
+compress
+
+*--- 2.4 Revisión rápida y guardado -------------------------------------------*
+summarize FEDFUNDS UNRATE ln_cpi ln_dep_real ln_sec_real ln_loan_real
+
+* Muestra efectiva disponible para el modelo bancario pre-Volcker:
+quietly count if pre_volcker == 1 & !missing(ln_dep_real, ln_sec_real, ln_loan_real)
+display as text "Obs. disponibles modelo bancario pre-Volcker: " as result r(N)
+
+notes: Muestra 1959m7-1989m12. Fuente FRED. Agregación semanal: $agreg_semanal
+save "$limpios/datos_bernanke_blinder_1992.dta", replace
+
+
+*==============================================================================*
+* PROGRAMA AUXILIAR: diagnósticos del VAR recién estimado                      *
+*==============================================================================*
+* Se define una vez y se aplica a cada modelo, para no repetir código.
+*   1) varstable : estabilidad -> todos los autovalores de la matriz compañera
+*                  deben estar dentro del círculo unitario (condición para que
+*                  exista la representación MA(inf) de Wold y las IRF converjan).
+*   2) varlmar   : prueba LM multivariada de autocorrelación de los residuos.
+*   3) wntestq   : Portmanteau (Ljung-Box) ecuación por ecuación; H0: ruido
+*                  blanco. Es univariada, por eso complementa a varlmar.
+*   4) vargranger: causalidad de Granger (poder predictivo, no causalidad
+*                  estructural).
+capture program drop diag_var
+program define diag_var
+    args etiqueta neq hlag
+
+    display _n as text "{hline 70}"
+    display as text "DIAGNÓSTICOS: " as result "`etiqueta'"
+    display as text "{hline 70}"
+
+    varstable, graph
+    graph export "$graf/estabilidad_`etiqueta'.png", replace width(2000)
+
+    varlmar, mlag(`hlag')
+
+    forvalues k = 1/`neq' {
+        tempvar u
+        quietly predict double `u', residuals equation(#`k')
+        display _n as text "Portmanteau, residuos de la ecuación " as result "`k'"
+        wntestq `u' if !missing(`u'), lags(`hlag')
+        drop `u'
+    }
+
+    vargranger
+end
+
+
+*==============================================================================*
+* 3. MODELO MACRO: [UNRATE -> ln_cpi -> FEDFUNDS]                              *
+*==============================================================================*
+* Identificación recursiva (Cholesky). Con FEDFUNDS al final, el desempleo y
+* los precios no responden dentro del mes a la política monetaria
+* (b_13 = b_23 = 0), mientras que el Fed sí observa y reacciona en el mes a la
+* economía. Así, la innovación ortogonalizada de FEDFUNDS es el choque de
+* política monetaria.
+
+local macro "UNRATE ln_cpi FEDFUNDS"
+
+* Archivo donde se guardan todas las IRF/FEVD del proyecto.
+irf set "$tab/irf_bb1992", replace
+
+*--- 3.1 Muestra completa 1959m7-1989m12 --------------------------------------*
+* Selección de rezagos: se reportan AIC, HQIC y SBIC. HQIC es el criterio que
+* Ivanov y Kilian (2005) recomiendan para datos mensuales; aquí es sólo un
+* diagnóstico, porque el VAR se estima con 6 rezagos, como en el paper.
+varsoc `macro', maxlag(`pmax')
+
+var `macro', lags(1/`p')
+estimates store var_macro_base
+
+diag_var macro_base 3 `hlag'
+
+* IRF ortogonalizadas con errores estándar asintóticos (bandas al 95%).
+irf create macro_base, step(48) order(`macro')
+
+*--- 3.2 Submuestra pre-Volcker 1959m7-1979m9 ---------------------------------*
+varsoc `macro' if pre_volcker == 1, maxlag(`pmax')
+
+var `macro' if pre_volcker == 1, lags(1/`p')
+estimates store var_macro_prev
+
+diag_var macro_prev 3 `hlag'
+
+irf create macro_prev, step(48) order(`macro')
+
+*--- 3.3 Gráficas: respuesta a un choque de 1 d.e. en FEDFUNDS ----------------*
+foreach m in macro_base macro_prev {
+    foreach h in 24 48 {
+        irf graph oirf, irf(`m') impulse(FEDFUNDS) response(`macro') ///
+            ustep(`h') level(95) ///
+            byopts(title("Respuestas a un choque en FEDFUNDS (`m', `h' meses)") ///
+                   note("OIRF, Cholesky [UNRATE, ln_cpi, FEDFUNDS]; bandas al 95%"))
+        graph export "$graf/oirf_`m'_h`h'.png", replace width(2000)
+    }
+}
+
+
+*==============================================================================*
+* 4. MODELO DE CRÉDITO BANCARIO (pre-Volcker)                                  *
+*    [FEDFUNDS -> Depósitos -> Títulos -> Préstamos -> UNRATE]                 *
+*==============================================================================*
+* Con FEDFUNDS primero, el choque de política afecta a todas las variables
+* dentro del mes. El orden depósitos -> títulos -> préstamos refleja la
+* hipótesis del canal de crédito: ante una caída de depósitos, los bancos
+* ajustan primero los títulos (líquidos) y después los préstamos
+* (cuasi-contractuales). La muestra efectiva empieza cuando existen los datos
+* semanales del H.8 (1973) y termina en 1979m9.
+
+local banco "FEDFUNDS ln_dep_real ln_sec_real ln_loan_real UNRATE"
+
+varsoc `banco' if pre_volcker == 1, maxlag(`pmax')
+
+var `banco' if pre_volcker == 1, lags(1/`p')
+estimates store var_banco_prev
+
+diag_var banco_prev 5 `hlag'
+
+irf create banco_prev, step(48) order(`banco')
+
+foreach h in 24 48 {
+    irf graph oirf, irf(banco_prev) impulse(FEDFUNDS) response(`banco') ///
+        ustep(`h') level(95) ///
+        byopts(title("Canal de crédito: choque en FEDFUNDS (`h' meses)") ///
+               note("OIRF, Cholesky [FEDFUNDS, dep., títulos, préstamos, UNRATE]; bandas al 95%"))
+    graph export "$graf/oirf_banco_prev_h`h'.png", replace width(2000)
+}
+
+
+*==============================================================================*
+* 5. DESCOMPOSICIÓN DE VARIANZA DEL ERROR DE PRONÓSTICO (FEVD)                 *
+*==============================================================================*
+* Porcentaje de la varianza del error de pronóstico a h pasos de cada variable
+* atribuible a cada choque estructural. En Stata, step(h) = pronóstico h meses
+* adelante. B&B reportan el horizonte de 24 meses (Tabla 2).
+
+*--- 5.1 Tablas en pantalla (contribución del choque en FEDFUNDS) -------------*
+irf table fevd, irf(macro_base) impulse(FEDFUNDS) response(`macro') step(36)
+irf table fevd, irf(macro_prev) impulse(FEDFUNDS) response(`macro') step(36)
+irf table fevd, irf(banco_prev) impulse(FEDFUNDS) response(`banco') step(36)
+
+*--- 5.2 Tabla resumen a 12, 24 y 36 meses (todos los choques) ----------------*
+preserve
+    use "$tab/irf_bb1992.irf", clear
+    keep if inlist(step, 12, 24, 36)
+    keep irfname response impulse step fevd
+    replace fevd = 100*fevd                 // En porcentaje
+    format fevd %6.2f
+    reshape wide fevd, i(irfname response step) j(impulse) string
+    sort irfname response step
+    list, sepby(irfname response) noobs abbreviate(20)
+    export delimited using "$tab/fevd_12_24_36.csv", replace
+restore
+
+
+*==============================================================================*
+* CIERRE                                                                       *
+*==============================================================================*
+display _n as text "Listo. Resultados en: " as result "$raiz"
+log close
